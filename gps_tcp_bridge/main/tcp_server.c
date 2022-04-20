@@ -13,6 +13,7 @@
 #include <sys/param.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -41,7 +42,10 @@
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
+#include "esp_task_wdt.h"
 
+#define EXAMPLE_ESP_WIFI_SSID "ZeleniySlonik"
+#define EXAMPLE_ESP_WIFI_PASS "a1234-b6789"
 #define HASH_LEN 32
 #define TCP_BUFFER_SIZE 128
 
@@ -75,6 +79,13 @@ uint8_t rx_buffer[TCP_BUFFER_SIZE];
 uint8_t tx_buffer[TCP_BUFFER_SIZE];
 uint8_t rx_buffer_cli[TCP_BUFFER_SIZE];
 
+static int s_retry_num = 0;
+/* FreeRTOS event group to signal when we are connected*/
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA2_PSK
+
 struct bridge_status {
 	uint32_t count_uart_rx;
 	uint32_t count_tcp_tx;
@@ -90,7 +101,7 @@ const uint8_t gps_uart_command4[] = {0xb5, 0x62, 0x06, 0x01, 0x08, 0x00, 0x03, 0
 const uint8_t gps_uart_command5[] = {0xb5, 0x62, 0x06, 0x01, 0x08, 0x00, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x31, 0x90};
 const uint8_t gps_uart_command6[] = {0xb5, 0x62, 0x06, 0x01, 0x08, 0x00, 0x01, 0x22, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x33, 0x9e};
 #define OTA_URL_SIZE 256
-#define CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL "https://192.168.10.4:8443/tcp_server_v1.11.bin"
+#define CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL "https://192.168.10.4:8443/tcp_server_v1.13.bin"
 
 esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
@@ -160,11 +171,6 @@ static void do_retransmit(const int sock)
     do {
 	vTaskDelay(2 / portTICK_PERIOD_MS);
         len = recv(sock, rx_buffer, TCP_BUFFER_SIZE, MSG_DONTWAIT);
-//	ESP_LOGI(TAG, "Recv tcp len: %d", len);
-/*	if (len == 0) {
-	   ESP_LOGW(TAG, "Connection closed len=0");
-	   return;
-	} */
 	if (len < 0) {
 	   if (errno != EAGAIN) {
 		ESP_LOGW(TAG, "Connection errno: %d, closed", errno);
@@ -173,7 +179,7 @@ static void do_retransmit(const int sock)
 	}
 	if (len > 0) uart_write_bytes(ECHO_UART_PORT_NUM, (const char *) rx_buffer, len);
 //xStreamBufferSend (stream_buffer_rx, (void *) data, len, 3 / portTICK_PERIOD_MS);
-	uint32_t length  = xStreamBufferReceive (stream_buffer_ex, (void *) tx_buffer, TCP_BUFFER_SIZE, 1 / portTICK_PERIOD_MS);
+	uint32_t length  = xStreamBufferReceive (stream_buffer_ex, (void *) tx_buffer, TCP_BUFFER_SIZE, 2 / portTICK_PERIOD_MS);
 	if(length>0) {
             int written = send(sock, tx_buffer, length, 0);
 	    if(written>0) status.count_tcp_tx += written;
@@ -412,7 +418,7 @@ static void echo_task(void *arg)
     while (1) {
         // Read data from the UART
 	// xSemaphoreTake(print_mux, portMAX_DELAY);
-        int len = uart_read_bytes(ECHO_UART_PORT_NUM, uart_data, UART_BUF_SIZE, 4 / portTICK_PERIOD_MS);
+        int len = uart_read_bytes(ECHO_UART_PORT_NUM, uart_data, UART_BUF_SIZE, 10 / portTICK_PERIOD_MS);
 	//ESP_LOGI(TAG, "Recv uart len: %d", len);
         // Write data back to the UART
         // uart_write_bytes(ECHO_UART_PORT_NUM, (const char *) data, len);
@@ -423,7 +429,7 @@ static void echo_task(void *arg)
 //            ESP_LOGI(TAG, "Recv str: %s", (char *) data);
         }
 	//xSemaphoreGive(print_mux);
-	vTaskDelay(1 / portTICK_PERIOD_MS);
+	vTaskDelay(2 / portTICK_PERIOD_MS);
     }
 }
 
@@ -446,9 +452,87 @@ static void gpio_task(void *arg)
 
     while(1) {
         gpio_set_level(GPIO_OUTPUT_IO_0, 1);
-	vTaskDelay(1000 / portTICK_PERIOD_MS);
+	vTaskDelay(500 / portTICK_PERIOD_MS);
 	gpio_set_level(GPIO_OUTPUT_IO_0, 0);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+
+static void event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+    if        (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "retry to connect to the AP");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .password = EXAMPLE_ESP_WIFI_PASS,
+            /* Setting a password implies station will connect to all security modes including WEP/WPA.
+             * However these modes are deprecated and not advisable to be used. Incase your Access point
+             * doesn't support WPA2, these mode can be enabled by commenting below line */
+	     .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_start() );
+
+    ESP_LOGI(TAG, "wifi_init_sta finished.");
+
+    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
+     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+            WIFI_CONNECTED_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY);
+
+    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
+     * happened. */
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
+                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
+                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    } else {
+        ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
 }
 
@@ -465,14 +549,15 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    //ESP_ERROR_CHECK(esp_netif_init());
+    //ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
      * Read "Establishing Wi-Fi or Ethernet Connection" section in
      * examples/protocols/README.md for more information about this function.
      */
-    ESP_ERROR_CHECK(example_connect());
+    // ESP_ERROR_CHECK(example_connect());
+    wifi_init_sta();
     simple_ota_example_task();   
 
     //print_mux = xSemaphoreCreateMutex();
