@@ -461,6 +461,7 @@ static void gpio_task(void *arg)
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
+    ESP_LOGI(TAG, "Event: %s, id: %d", event_base, event_id);
     if        (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -549,14 +550,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    //ESP_ERROR_CHECK(esp_netif_init());
-    //ESP_ERROR_CHECK(esp_event_loop_create_default());
+    /* ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(example_connect()); */
 
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-     */
-    // ESP_ERROR_CHECK(example_connect());
     wifi_init_sta();
     simple_ota_example_task();   
 
